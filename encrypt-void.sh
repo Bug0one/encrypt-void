@@ -4,7 +4,7 @@
 #  Suporte a XFCE4 ou MATE + LightDM
 #  Uso: boot pelo live ISO do Void, execute como root
 # =============================================================================
-
+# Script criando para aprendizado do void linux
 set -euo pipefail
 
 # ── Cores ─────────────────────────────────────────────────────────────────────
