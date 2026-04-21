@@ -1,10 +1,11 @@
 #!/bin/bash
 # =============================================================================
-#  Void Linux Installer - GRUB + ext4 + LVM sobre LUKS
-#  Suporte a XFCE4 ou MATE + LightDM
+#  Void Linux Installer - Seguindo documentação oficial do Void Linux
+#  GRUB + LUKS1 + LVM + ext4 + XFCE4 ou MATE + LightDM
+#  Referência: https://docs.voidlinux.org/installation/full-disk-encryption.html
 #  Uso: boot pelo live ISO do Void, execute como root
 # =============================================================================
-# Script criando para aprendizado do void linux
+
 set -euo pipefail
 
 # ── Cores ─────────────────────────────────────────────────────────────────────
@@ -28,8 +29,8 @@ command -v xbps-install &>/dev/null || error "Este script deve rodar dentro do l
 # ── Instalar dependências no live ISO ─────────────────────────────────────────
 header "VERIFICANDO DEPENDÊNCIAS"
 info "Instalando ferramentas necessárias..."
-xbps-install -Sy gptfdisk cryptsetup lvm2 parted || error "Falha ao instalar dependências"
-command -v sgdisk   &>/dev/null || error "sgdisk não encontrado"
+xbps-install -Sy gptfdisk cryptsetup lvm2 parted xtools || error "Falha ao instalar dependências"
+command -v sgdisk    &>/dev/null || error "sgdisk não encontrado"
 command -v partprobe &>/dev/null || error "partprobe não encontrado"
 ok "Dependências prontas"
 
@@ -64,22 +65,58 @@ warn "TODO O CONTEÚDO DE $DISK SERÁ APAGADO!"
 read -rp "Tem certeza? Digite 'SIM' para continuar: " CONFIRM
 [[ "$CONFIRM" != "SIM" ]] && error "Instalação cancelada."
 
+# Sufixo de partição (nvme/mmcblk usam 'p')
+if [[ "$DISK_NAME" == nvme* ]] || [[ "$DISK_NAME" == mmcblk* ]]; then
+    P="p"
+else
+    P=""
+fi
+
 # =============================================================================
 #  ETAPA 2 — Criptografia?
 # =============================================================================
 header "CRIPTOGRAFIA"
 
 ENCRYPT=false
-read -rp "$(echo -e "${BOLD}Deseja usar criptografia LUKS+LVM? [s/N]: ${NC}")" USE_CRYPT
+read -rp "$(echo -e "${BOLD}Deseja usar criptografia LUKS? [s/N]: ${NC}")" USE_CRYPT
 if [[ "$USE_CRYPT" =~ ^[Ss]$ ]]; then
     ENCRYPT=true
-    ok "Criptografia LUKS+LVM ativada"
+    ok "Criptografia LUKS1 ativada (compatível com GRUB)"
 else
     info "Instalação sem criptografia"
 fi
 
 # =============================================================================
-#  ETAPA 3 — Desktop Environment
+#  ETAPA 3 — Particionamento LVM
+# =============================================================================
+header "ESQUEMA DE PARTICIONAMENTO"
+
+echo "  1) Somente /          (tudo em uma partição)"
+echo "  2) / + swap"
+echo "  3) / + swap + /home   (recomendado)"
+echo ""
+while true; do
+    read -rp "$(echo -e "${BOLD}Escolha [1/2/3]: ${NC}")" LVM_CHOICE
+    case "$LVM_CHOICE" in
+        1) LVM_SCHEME="root_only"; break ;;
+        2) LVM_SCHEME="root_swap"; break ;;
+        3) LVM_SCHEME="root_swap_home"; break ;;
+        *) warn "Opção inválida." ;;
+    esac
+done
+
+if [[ "$LVM_SCHEME" == "root_swap" ]] || [[ "$LVM_SCHEME" == "root_swap_home" ]]; then
+    read -rp "$(echo -e "${BOLD}Tamanho do swap (ex: 2G, 4G) [2G]: ${NC}")" SWAP_SIZE
+    [[ -z "$SWAP_SIZE" ]] && SWAP_SIZE="2G"
+fi
+
+if [[ "$LVM_SCHEME" == "root_swap_home" ]]; then
+    read -rp "$(echo -e "${BOLD}Tamanho do / raiz (ex: 20G, 30G) [20G]: ${NC}")" ROOT_SIZE
+    [[ -z "$ROOT_SIZE" ]] && ROOT_SIZE="20G"
+fi
+
+# =============================================================================
+#  ETAPA 4 — Desktop Environment
 # =============================================================================
 header "AMBIENTE DE DESKTOP"
 
@@ -97,7 +134,7 @@ done
 ok "Desktop selecionado: $DE com LightDM"
 
 # =============================================================================
-#  ETAPA 4 — Dados do sistema
+#  ETAPA 5 — Dados do sistema
 # =============================================================================
 header "CONFIGURAÇÃO DO SISTEMA"
 
@@ -137,17 +174,18 @@ read -rp "$(echo -e "${BOLD}Locale [pt_BR.UTF-8]: ${NC}")" LOCALE
 [[ -z "$LOCALE" ]] && LOCALE="pt_BR.UTF-8"
 
 # =============================================================================
-#  ETAPA 5 — Resumo e confirmação final
+#  ETAPA 6 — Resumo e confirmação final
 # =============================================================================
 header "RESUMO DA INSTALAÇÃO"
 
 echo -e "  Disco alvo   : ${BOLD}$DISK${NC}"
 echo -e "  Modo boot    : ${BOLD}${BOOT_MODE^^}${NC}"
 if $ENCRYPT; then
-    echo -e "  Criptografia : ${BOLD}SIM (LUKS+LVM)${NC}"
+    echo -e "  Criptografia : ${BOLD}SIM (LUKS1 — compatível com GRUB)${NC}"
 else
     echo -e "  Criptografia : ${BOLD}NÃO${NC}"
 fi
+echo -e "  LVM          : ${BOLD}$LVM_SCHEME${NC}"
 echo -e "  Desktop      : ${BOLD}${DE^^}${NC}"
 echo -e "  Hostname     : ${BOLD}$HOSTNAME${NC}"
 echo -e "  Usuário      : ${BOLD}$USERNAME${NC}"
@@ -159,7 +197,7 @@ read -rp "Iniciar instalação? Digite 'INSTALAR' para confirmar: " FINAL_CONFIR
 [[ "$FINAL_CONFIRM" != "INSTALAR" ]] && error "Instalação cancelada."
 
 # =============================================================================
-#  ETAPA 6 — Desmontar e particionar
+#  ETAPA 7 — Particionamento do disco
 # =============================================================================
 header "PARTICIONANDO $DISK"
 
@@ -172,34 +210,25 @@ dmsetup remove_all 2>/dev/null || true
 vgchange -an 2>/dev/null || true
 sleep 1
 
-# Zerar assinaturas antigas
 wipefs -af "$DISK"
 sgdisk --zap-all "$DISK"
 partprobe "$DISK"
 sleep 1
 
-# Sufixo de partição (nvme/mmcblk usam 'p')
-if [[ "$DISK_NAME" == nvme* ]] || [[ "$DISK_NAME" == mmcblk* ]]; then
-    P="p"
-else
-    P=""
-fi
-
 if [[ "$BOOT_MODE" == "uefi" ]]; then
-    info "Criando partições GPT (UEFI)"
-    sgdisk -n 1:0:+512M  -t 1:ef00 -c 1:"EFI"  "$DISK"
-    sgdisk -n 2:0:+1G    -t 2:8300 -c 2:"boot" "$DISK"
-    sgdisk -n 3:0:0      -t 3:8300 -c 3:"root" "$DISK"
+    info "Criando tabela GPT (UEFI)"
+    # Partição EFI + partição LUKS/raiz
+    sgdisk -n 1:0:+128M -t 1:ef00 -c 1:"EFI"  "$DISK"
+    sgdisk -n 2:0:0     -t 2:8300 -c 2:"root" "$DISK"
     PART_EFI="${DISK}${P}1"
-    PART_BOOT="${DISK}${P}2"
-    PART_ROOT="${DISK}${P}3"
+    PART_LUKS="${DISK}${P}2"
 else
-    info "Criando partições GPT/BIOS (Legacy)"
-    sgdisk -n 1:0:+1M    -t 1:ef02 -c 1:"bios" "$DISK"
-    sgdisk -n 2:0:+512M  -t 2:8300 -c 2:"boot" "$DISK"
-    sgdisk -n 3:0:0      -t 3:8300 -c 3:"root" "$DISK"
-    PART_BOOT="${DISK}${P}2"
-    PART_ROOT="${DISK}${P}3"
+    info "Criando tabela MBR (BIOS/Legacy)"
+    # Seguindo documentação: uma partição bootável
+    parted -s "$DISK" mklabel msdos
+    parted -s "$DISK" mkpart primary 1MiB 100%
+    parted -s "$DISK" set 1 boot on
+    PART_LUKS="${DISK}${P}1"
 fi
 
 partprobe "$DISK"
@@ -210,62 +239,121 @@ if [[ "$BOOT_MODE" == "uefi" ]]; then
     ok "Partição EFI formatada"
 fi
 
-mkfs.ext4 -F -L boot "$PART_BOOT"
-ok "Partição /boot formatada (ext4)"
+ok "Disco particionado"
 
 # =============================================================================
-#  ETAPA 7 — LUKS + LVM
+#  ETAPA 8 — LUKS1 + LVM (seguindo documentação oficial)
 # =============================================================================
 if $ENCRYPT; then
-    header "CONFIGURANDO LUKS + LVM"
+    header "CONFIGURANDO LUKS1 + LVM"
 
-    info "Formatando container LUKS2..."
+    # Documentação oficial usa LUKS1 — compatível com GRUB sem configuração extra
+    info "Formatando container LUKS1..."
     echo -n "$LUKS_PASS" | cryptsetup luksFormat \
-        --type luks2 \
-        --cipher aes-xts-plain64 \
-        --key-size 512 \
-        --hash sha512 \
-        --pbkdf argon2id \
-        "$PART_ROOT" -
+        --type luks1 \
+        "$PART_LUKS" -
 
     info "Abrindo container LUKS..."
-    echo -n "$LUKS_PASS" | cryptsetup open "$PART_ROOT" cryptlvm -
+    echo -n "$LUKS_PASS" | cryptsetup luksOpen "$PART_LUKS" voidvm -
 
-    LUKS_UUID=$(blkid -s UUID -o value "$PART_ROOT")
-    LVM_DEV="/dev/mapper/cryptlvm"
+    LUKS_UUID=$(blkid -s UUID -o value "$PART_LUKS")
+    LVM_DEV="/dev/mapper/voidvm"
 
+    info "Criando LVM..."
     pvcreate "$LVM_DEV"
-    vgcreate vgvoid "$LVM_DEV"
-    lvcreate -l 100%FREE vgvoid -n root
+    vgcreate voidvm "$LVM_DEV"
 
-    PART_REALROOT="/dev/vgvoid/root"
-    ok "LVM configurado: /dev/vgvoid/root"
+    case "$LVM_SCHEME" in
+        root_only)
+            lvcreate --name root -l 100%FREE voidvm
+            ;;
+        root_swap)
+            lvcreate --name swap -L "$SWAP_SIZE" voidvm
+            lvcreate --name root -l 100%FREE voidvm
+            ;;
+        root_swap_home)
+            lvcreate --name root -L "$ROOT_SIZE" voidvm
+            lvcreate --name swap -L "$SWAP_SIZE" voidvm
+            lvcreate --name home -l 100%FREE voidvm
+            ;;
+    esac
+
+    ok "LVM configurado"
+    PART_ROOT="/dev/voidvm/root"
+    PART_SWAP="/dev/voidvm/swap"
+    PART_HOME="/dev/voidvm/home"
+
 else
-    PART_REALROOT="$PART_ROOT"
+    # Sem criptografia — LVM direto sobre a partição
+    info "Criando LVM direto..."
+    pvcreate "$PART_LUKS"
+    vgcreate voidvm "$PART_LUKS"
+
+    case "$LVM_SCHEME" in
+        root_only)
+            lvcreate --name root -l 100%FREE voidvm
+            ;;
+        root_swap)
+            lvcreate --name swap -L "$SWAP_SIZE" voidvm
+            lvcreate --name root -l 100%FREE voidvm
+            ;;
+        root_swap_home)
+            lvcreate --name root -L "$ROOT_SIZE" voidvm
+            lvcreate --name swap -L "$SWAP_SIZE" voidvm
+            lvcreate --name home -l 100%FREE voidvm
+            ;;
+    esac
+
     LUKS_UUID=""
+    PART_ROOT="/dev/voidvm/root"
+    PART_SWAP="/dev/voidvm/swap"
+    PART_HOME="/dev/voidvm/home"
 fi
 
 # =============================================================================
-#  ETAPA 8 — Formatar raiz e montar
+#  ETAPA 9 — Formatar e montar
 # =============================================================================
 header "FORMATANDO E MONTANDO"
 
-mkfs.ext4 -F -L void-root "$PART_REALROOT"
-ok "Partição raiz formatada (ext4)"
+mkfs.ext4 -F -L void-root "$PART_ROOT"
+ok "/ formatado (ext4)"
 
-mount "$PART_REALROOT" /mnt
-mkdir -p /mnt/boot
-mount "$PART_BOOT" /mnt/boot
+if [[ "$LVM_SCHEME" == "root_swap" ]] || [[ "$LVM_SCHEME" == "root_swap_home" ]]; then
+    mkswap "$PART_SWAP"
+    swapon "$PART_SWAP"
+    ok "swap ativado"
+fi
+
+if [[ "$LVM_SCHEME" == "root_swap_home" ]]; then
+    mkfs.ext4 -F -L void-home "$PART_HOME"
+    ok "/home formatado (ext4)"
+fi
+
+# Montar
+mount "$PART_ROOT" /mnt
+
+if [[ "$LVM_SCHEME" == "root_swap_home" ]]; then
+    mkdir -p /mnt/home
+    mount "$PART_HOME" /mnt/home
+fi
 
 if [[ "$BOOT_MODE" == "uefi" ]]; then
     mkdir -p /mnt/boot/efi
     mount "$PART_EFI" /mnt/boot/efi
 fi
 
-ok "Sistema de arquivos montado em /mnt"
+ok "Sistemas de arquivos montados"
 
 # =============================================================================
-#  ETAPA 9 — Instalação dos pacotes
+#  ETAPA 10 — Copiar chaves RSA do live ISO (documentação oficial)
+# =============================================================================
+info "Copiando chaves RSA do repositório..."
+mkdir -p /mnt/var/db/xbps/keys
+cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
+ok "Chaves RSA copiadas (sem prompt durante instalação)"
+
+# =============================================================================
+#  ETAPA 11 — Instalação dos pacotes via XBPS
 # =============================================================================
 header "INSTALANDO SISTEMA BASE"
 
@@ -273,14 +361,12 @@ MIRROR="https://repo-default.voidlinux.org/current"
 XBPS_ARCH=$(xbps-uhelper arch)
 info "Arquitetura: $XBPS_ARCH"
 
+# Pacotes base conforme documentação oficial
 BASE_PKGS=(
     base-system
-    grub
-    os-prober
     lvm2
     cryptsetup
-    linux
-    linux-headers
+    grub
     vim
     nano
     curl
@@ -299,13 +385,13 @@ BASE_PKGS=(
     lightdm-gtk3-greeter
 )
 
-# grub-x86_64-efi somente em UEFI (evita elemento vazio no array)
+# GRUB EFI apenas se UEFI
 if [[ "$BOOT_MODE" == "uefi" ]]; then
     BASE_PKGS+=(grub-x86_64-efi)
 fi
 
+# Pacotes do DE
 if [[ "$DE" == "xfce4" ]]; then
-    # xfce4 meta-pacote já inclui: Thunar, ristretto, mousepad, xfce4-terminal, etc.
     DE_PKGS=(
         xfce4
         xfce4-screenshooter
@@ -319,7 +405,6 @@ if [[ "$DE" == "xfce4" ]]; then
         tumbler
     )
 else
-    # mate meta-pacote já inclui a maioria dos apps
     DE_PKGS=(
         mate
         mate-extra
@@ -334,7 +419,7 @@ ALL_PKGS=("${BASE_PKGS[@]}" "${DE_PKGS[@]}")
 
 info "Instalando pacotes (pode demorar alguns minutos)..."
 XBPS_ARCH="$XBPS_ARCH" xbps-install \
-    -S \
+    -Sy \
     -R "$MIRROR" \
     -r /mnt \
     "${ALL_PKGS[@]}" || error "Falha na instalação dos pacotes"
@@ -342,23 +427,19 @@ XBPS_ARCH="$XBPS_ARCH" xbps-install \
 ok "Pacotes instalados com sucesso"
 
 # =============================================================================
-#  ETAPA 10 — Configuração base
+#  ETAPA 12 — Gerar fstab com xgenfstab (documentação oficial)
+# =============================================================================
+header "GERANDO FSTAB"
+
+# Documentação oficial usa xgenfstab do xtools
+xgenfstab /mnt > /mnt/etc/fstab
+ok "/etc/fstab gerado via xgenfstab"
+cat /mnt/etc/fstab
+
+# =============================================================================
+#  ETAPA 13 — Configurações base fora do chroot
 # =============================================================================
 header "CONFIGURANDO O SISTEMA"
-
-BOOT_UUID=$(blkid -s UUID -o value "$PART_BOOT")
-ROOT_UUID=$(blkid -s UUID -o value "$PART_REALROOT")
-
-{
-    echo "# /etc/fstab gerado pelo void-install.sh"
-    if [[ "$BOOT_MODE" == "uefi" ]]; then
-        EFI_UUID=$(blkid -s UUID -o value "$PART_EFI")
-        echo "UUID=$EFI_UUID  /boot/efi  vfat  defaults  0 2"
-    fi
-    echo "UUID=$BOOT_UUID  /boot  ext4  defaults  0 2"
-    echo "UUID=$ROOT_UUID  /      ext4  defaults  0 1"
-    echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev  0 0"
-} > /mnt/etc/fstab
 
 echo "$HOSTNAME" > /mnt/etc/hostname
 echo "LANG=$LOCALE" > /mnt/etc/locale.conf
@@ -378,15 +459,10 @@ cat > /mnt/etc/hosts <<EOF
 ::1         localhost ip6-localhost ip6-loopback
 EOF
 
-if $ENCRYPT; then
-    echo "cryptlvm  UUID=$LUKS_UUID  none  luks" > /mnt/etc/crypttab
-    ok "/etc/crypttab configurado"
-fi
-
 ok "Configurações básicas aplicadas"
 
 # =============================================================================
-#  ETAPA 11 — Chroot
+#  ETAPA 14 — Chroot (usando xchroot do xtools, como na documentação)
 # =============================================================================
 header "CONFIGURANDO DENTRO DO CHROOT"
 
@@ -395,18 +471,12 @@ mount --rbind /dev  /mnt/dev;  mount --make-rslave /mnt/dev
 mount --rbind /proc /mnt/proc; mount --make-rslave /mnt/proc
 cp /etc/resolv.conf /mnt/etc/resolv.conf
 
-# Exportar variáveis para uso dentro do heredoc do chroot
-_USERNAME="$USERNAME"
-_USER_PASS="$USER_PASS"
-_ROOT_PASS="$ROOT_PASS"
-_DE="$DE"
-_BOOT_MODE="$BOOT_MODE"
-_ENCRYPT="$ENCRYPT"
-_LUKS_UUID="$LUKS_UUID"
-_DISK="$DISK"
-
-chroot /mnt /bin/bash -s "$_USERNAME" "$_USER_PASS" "$_ROOT_PASS" \
-    "$_DE" "$_BOOT_MODE" "$_ENCRYPT" "$_LUKS_UUID" "$_DISK" <<'CHROOT_EOF'
+# Passar variáveis para o chroot via argumentos posicionais
+chroot /mnt /bin/bash -s \
+    "$USERNAME" "$USER_PASS" "$ROOT_PASS" \
+    "$DE" "$BOOT_MODE" "$ENCRYPT" \
+    "${LUKS_UUID:-}" "$DISK" "$LVM_SCHEME" \
+    "${SWAP_SIZE:-}" "$LOCALE" <<'CHROOT_EOF'
 
 USERNAME="$1"
 USER_PASS="$2"
@@ -416,12 +486,20 @@ BOOT_MODE="$5"
 ENCRYPT="$6"
 LUKS_UUID="$7"
 DISK="$8"
+LVM_SCHEME="$9"
+SWAP_SIZE="${10}"
+LOCALE="${11}"
 
 set -euo pipefail
 
+# Permissões corretas (documentação oficial)
+chown root:root /
+chmod 755 /
+
+# Locale
 xbps-reconfigure -f glibc-locales
 
-# Definir senhas via openssl (funciona sempre no chroot do Void)
+# Senhas via openssl (confiável no chroot)
 ROOT_HASH=$(openssl passwd -6 "${ROOT_PASS}")
 USER_HASH=$(openssl passwd -6 "${USER_PASS}")
 usermod -p "${ROOT_HASH}" root
@@ -431,57 +509,68 @@ usermod -p "${USER_HASH}" "${USERNAME}"
 echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/wheel
 chmod 440 /etc/sudoers.d/wheel
 
+# Serviços runit
 for svc in dbus elogind NetworkManager lightdm; do
     ln -sf /etc/sv/$svc /etc/runit/runsvdir/default/ 2>/dev/null || true
 done
 
+# Sessão LightDM (xfce4 -> xfce no lightdm)
 mkdir -p /etc/lightdm
 LIGHTDM_CFG="/etc/lightdm/lightdm.conf"
+SESSION_NAME="$DE"
+[[ "$DE" == "xfce4" ]] && SESSION_NAME="xfce"
 if grep -q "^\[Seat:\*\]" "$LIGHTDM_CFG" 2>/dev/null; then
-    # xfce4 no LightDM se chama "xfce", não "xfce4"
-    SESSION_NAME="${DE}"
-    [[ "$DE" == "xfce4" ]] && SESSION_NAME="xfce"
     sed -i "s|^#*user-session=.*|user-session=${SESSION_NAME}|" "$LIGHTDM_CFG"
 else
-    SESSION_NAME="${DE}"
-    [[ "$DE" == "xfce4" ]] && SESSION_NAME="xfce"
     printf '\n[Seat:*]\nuser-session=%s\n' "${SESSION_NAME}" >> "$LIGHTDM_CFG"
 fi
 
-mkdir -p /etc/dracut.conf.d
-cat > /etc/dracut.conf.d/void.conf <<DRACUT
-hostonly=yes
-hostonly_cmdline=yes
-add_dracutmodules+=" crypt dm lvm resume "
-omit_dracutmodules+=" network "
-DRACUT
-
+# ── GRUB com LUKS ─────────────────────────────────────────────────────────────
 if [[ "$ENCRYPT" == "true" ]]; then
-    mkdir -p /etc/kernel
-    echo "rd.luks.uuid=${LUKS_UUID} rd.lvm.vg=vgvoid root=/dev/vgvoid/root" \
-        > /etc/kernel/cmdline
+    # Documentação oficial: GRUB_ENABLE_CRYPTODISK=y
+    echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub
+
+    # rd.lvm.vg + rd.luks.uuid no cmdline
+    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"loglevel=4 rd.lvm.vg=voidvm rd.luks.uuid=${LUKS_UUID}\"|" \
+        /etc/default/grub
+
+    # ── Keyfile para não digitar senha 2x (documentação oficial) ──────────────
+    info_chroot() { echo "[chroot] $*"; }
+    info_chroot "Gerando keyfile LUKS..."
+    dd bs=1 count=64 if=/dev/urandom of=/boot/volume.key 2>/dev/null
+    chmod 000 /boot/volume.key
+    chmod -R g-rwx,o-rwx /boot
+
+    # Adicionar keyfile ao LUKS (precisa da senha)
+    # Será feito fora do chroot pois precisa do dispositivo físico
+
+    # crypttab com keyfile
+    echo "voidvm   /dev/disk/by-uuid/${LUKS_UUID}   /boot/volume.key   luks" \
+        > /etc/crypttab
+
+    # dracut para incluir keyfile e crypttab no initramfs
+    mkdir -p /etc/dracut.conf.d
+    cat > /etc/dracut.conf.d/10-crypt.conf <<DRACUT
+add_dracutmodules+=" crypt dm lvm "
+install_items+=" /boot/volume.key /etc/crypttab "
+DRACUT
 fi
 
-KVER=$(ls /lib/modules | sort -V | tail -1)
-dracut --force --kver "$KVER"
+sed -i 's/^#*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
 
+# ── Instalar GRUB ─────────────────────────────────────────────────────────────
 if [[ "$BOOT_MODE" == "uefi" ]]; then
     grub-install --target=x86_64-efi \
         --efi-directory=/boot/efi \
         --bootloader-id=VOID \
         --recheck
 else
-    grub-install --target=i386-pc --recheck "${DISK}"
+    # Documentação oficial: grub-install /dev/sda (simples)
+    grub-install "$DISK"
 fi
 
-if [[ "$ENCRYPT" == "true" ]]; then
-    sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"rd.luks.uuid=${LUKS_UUID} rd.lvm.vg=vgvoid root=/dev/vgvoid/root\"|" \
-        /etc/default/grub
-    echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub
-fi
-
-sed -i 's/^#*GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
-update-grub
+# ── Gerar initramfs e reconfigurar todos os pacotes (documentação oficial) ────
+xbps-reconfigure -fa
 
 echo "[chroot] Concluído com sucesso"
 CHROOT_EOF
@@ -489,14 +578,25 @@ CHROOT_EOF
 ok "Chroot concluído"
 
 # =============================================================================
-#  ETAPA 12 — Finalização
+#  ETAPA 15 — Adicionar keyfile ao LUKS (fora do chroot, acessa dispositivo)
+# =============================================================================
+if $ENCRYPT; then
+    header "CONFIGURANDO KEYFILE LUKS"
+    info "Adicionando keyfile ao container LUKS (digite a senha LUKS quando solicitado)..."
+    cryptsetup luksAddKey "$PART_LUKS" /mnt/boot/volume.key
+    ok "Keyfile adicionado — sistema não pedirá senha duas vezes no boot"
+fi
+
+# =============================================================================
+#  ETAPA 16 — Finalização
 # =============================================================================
 header "FINALIZANDO"
 
 umount -R /mnt 2>/dev/null || true
+
 if $ENCRYPT; then
-    vgchange -an vgvoid 2>/dev/null || true
-    cryptsetup close cryptlvm 2>/dev/null || true
+    vgchange -an voidvm 2>/dev/null || true
+    cryptsetup close voidvm 2>/dev/null || true
 fi
 
 echo ""
@@ -504,11 +604,13 @@ echo -e "${GREEN}${BOLD}╔═════════════════�
 echo -e "${GREEN}${BOLD}║   INSTALAÇÃO CONCLUÍDA COM SUCESSO! 🎉  ║${NC}"
 echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  Desktop   : ${BOLD}${DE^^}${NC}"
-echo -e "  Usuário   : ${BOLD}$USERNAME${NC}"
-echo -e "  Hostname  : ${BOLD}$HOSTNAME${NC}"
+echo -e "  Desktop      : ${BOLD}${DE^^}${NC}"
+echo -e "  Usuário      : ${BOLD}$USERNAME${NC}"
+echo -e "  Hostname     : ${BOLD}$HOSTNAME${NC}"
+echo -e "  LVM          : ${BOLD}$LVM_SCHEME${NC}"
 if $ENCRYPT; then
-    echo -e "  Criptogr. : ${BOLD}LUKS2 + LVM (AES-256-XTS, Argon2id)${NC}"
+    echo -e "  Criptografia : ${BOLD}LUKS1 (compatível com GRUB)${NC}"
+    echo -e "  Keyfile      : ${BOLD}/boot/volume.key (sem dupla senha no boot)${NC}"
 fi
 echo ""
 echo -e "${YELLOW}  Remova a mídia de instalação e reinicie:${NC}"
